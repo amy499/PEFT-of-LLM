@@ -1,18 +1,22 @@
-import copy
 import json
+import math
 import os
 import re
 import sys
 import argparse
 
-import fire
-
 import torch
 
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+# Vendored peft fork: put it FIRST on sys.path, resolved relative to this file
+# (not the cwd), so a pip-installed peft can never shadow it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "peft", "src"))
+import peft  # noqa: E402
+print(f"Using peft from: {peft.__file__}")
 from peft import PeftModel
 from tqdm import tqdm
 from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer, AutoModelForCausalLM, AutoTokenizer
+
+from prompts import generate_prompt
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -26,16 +30,28 @@ except:  # noqa: E722
     pass
 
 
-def main(
-        load_8bit: bool = False,
-        base_model: str = "",
-        lora_weights: str = "tloen/alpaca-lora-7b",
-        share_gradio: bool = False,
-):
+def main():
     args = parse_args()
 
+    dataset = load_data(args)
+    if args.limit is not None:
+        dataset = dataset[: args.limit]
+    total = len(dataset)
+
+    # Resume: skip example indices already present in the JSONL output.
+    done = load_done_indices(args.out_file)
+    todo = [idx for idx in range(total) if idx not in done]
+    print(f"{len(done)} example(s) already in {args.out_file}; {len(todo)} of {total} to evaluate.")
+    if not todo:
+        report_accuracy(args.out_file, total)
+        return
+
+    tokenizer, model = load_model(args)
+    pad_token_id = configure_padding(tokenizer, model)
+    eos_ids = get_eos_ids(tokenizer, model)
+
     def evaluate(
-            instruction,
+            instructions,
             input=None,
             temperature=0.1,
             top_p=0.75,
@@ -44,120 +60,197 @@ def main(
             max_new_tokens=256,
             **kwargs,
     ):
-        prompt = generate_prompt(instruction, input)
-        inputs = tokenizer(prompt, return_tensors="pt")
+        prompts = [generate_prompt(instruction, input) for instruction in instructions]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True)  # left-padded
         input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
         generation_config = GenerationConfig(
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
             num_beams=num_beams,
+            pad_token_id=pad_token_id,
             **kwargs,
         )
         with torch.no_grad():
             generation_output = model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 generation_config=generation_config,
                 return_dict_in_generate=True,
                 output_scores=True,
                 max_new_tokens=max_new_tokens,
-                use_cache=False,
+                use_cache=True,
             )
-        s = generation_output.sequences[0]
-        output = tokenizer.decode(s)
-        return output.split("### Response:")[1].strip()
+        results = []
+        prompt_len = input_ids.shape[1]
+        for s in generation_output.sequences:
+            output = tokenizer.decode(s, skip_special_tokens=True)
+            output = output.split("### Response:")[1].strip()
+            n_generated, hit_max = count_generated(s[prompt_len:].tolist(), eos_ids, pad_token_id, max_new_tokens)
+            results.append((output, n_generated, hit_max))
+        return results
 
-    """
-    # testing code for readme
-    for instruction in [
-        "Tell me about alpacas.",
-        "Tell me about the president of Mexico in 2019.",
-        "Tell me about the king of France in 2019.",
-        "List all Canadian provinces in alphabetical order.",
-        "Write a Python program that prints the first 10 Fibonacci numbers.",
-        "Write a program that prints the numbers from 1 to 100. But for multiples of three print 'Fizz' instead of the number and for the multiples of five print 'Buzz'. For numbers which are multiples of both three and five print 'FizzBuzz'.",  # noqa: E501
-        "Tell me five words that rhyme with 'shock'.",
-        "Translate the sentence 'I have no mouth but I must scream' into Spanish.",
-        "Count up from 1 to 500.",
-    ]:
-        print("Instruction:", instruction)
-        print("Response:", evaluate(instruction))
-        print()
-    """
-    save_file = f'experiment/{args.model}-{args.adapter}-{args.dataset}.json'
-    create_dir('experiment/')
+    out_dir = os.path.dirname(os.path.abspath(args.out_file))
+    os.makedirs(out_dir, exist_ok=True)
+    ensure_trailing_newline(args.out_file)
 
-    dataset = load_data(args)
-    tokenizer, model = load_model(args)
-    total = len(dataset)
     correct = 0
-    miss = 0.001
-    output_data = []
-    pbar = tqdm(total=total)
-    for idx, data in enumerate(dataset):
-        instruction = data.get('instruction')
-
-        outputs = evaluate(instruction)
-        label = data.get('answer')
-        flag = False
-        if args.dataset.lower() in ['aqua']:
-            predict = extract_answer_letter(args, outputs)
-            if label == predict:
-                correct += 1
-                flag = True
-        else:
-            if isinstance(label, str):
-                label = float(label)
-            predict = extract_answer_number(args, outputs)
-            if abs(label - predict) <= miss:
-                correct += 1
-                flag = True
-        new_data = copy.deepcopy(data)
-        new_data['output_pred'] = outputs
-        new_data['pred'] = predict
-        new_data['flag'] = flag
-        output_data.append(new_data)
-        print(' ')
-        print('---------------')
-        print(outputs)
-        print('prediction:', predict)
-        print('label:', label)
-        print('---------------')
-        print(f'\rtest:{idx + 1}/{total} | accuracy {correct}  {correct / (idx + 1)}')
-        with open(save_file, 'w+') as f:
-            json.dump(output_data, f, indent=4)
-        pbar.update(1)
+    pbar = tqdm(total=len(todo))
+    for start in range(0, len(todo), args.batch_size):
+        batch_idx = todo[start: start + args.batch_size]
+        batch = [dataset[idx] for idx in batch_idx]
+        outputs = evaluate(
+            [data.get('instruction') for data in batch],
+            num_beams=args.num_beams,
+            max_new_tokens=args.max_new_tokens,
+        )
+        records = []
+        for idx, data, (output, n_generated, hit_max) in zip(batch_idx, batch, outputs):
+            label = data.get('answer')
+            predict, flag = score(args, label, output)
+            correct += int(flag)
+            records.append({
+                "index": idx,
+                "instruction": data.get('instruction'),
+                "label": label,
+                "output": output,
+                # float('inf') (no number found) is not valid JSON; stored as null.
+                "prediction": predict if not (isinstance(predict, float) and not math.isfinite(predict)) else None,
+                "correct": flag,
+                "generated_tokens": n_generated,
+                "hit_max_tokens": hit_max,
+            })
+            print(' ')
+            print('---------------')
+            print(output)
+            print('prediction:', predict)
+            print('label:', label)
+            print('---------------')
+        # Append-only: one JSON object per line, flushed after every batch.
+        with open(args.out_file, 'a', encoding='utf-8') as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        pbar.update(len(batch_idx))
+        print(f'\rthis run: {start + len(batch_idx)}/{len(todo)} | accuracy {correct}  '
+              f'{correct / (start + len(batch_idx))}')
     pbar.close()
     print('\n')
     print('test finished')
+    report_accuracy(args.out_file, total)
 
 
-def create_dir(dir_path):
-    if not os.path.exists(dir_path):
-        os.mkdir(dir_path)
-    return
-
-
-def generate_prompt(instruction, input=None):
-    if input:
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-                ### Instruction:
-                {instruction}
-
-                ### Input:
-                {input}
-
-                ### Response:
-                """  # noqa: E501
+def score(args, label, outputs):
+    """Original scoring logic, unchanged: first-letter extraction for AQuA,
+    last number with absolute tolerance 0.001 for everything else."""
+    miss = 0.001
+    flag = False
+    if args.dataset.lower() in ['aqua']:
+        predict = extract_answer_letter(args, outputs)
+        if label == predict:
+            flag = True
     else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request. 
+        if isinstance(label, str):
+            label = float(label)
+        predict = extract_answer_number(args, outputs)
+        if abs(label - predict) <= miss:
+            flag = True
+    return predict, flag
 
-                ### Instruction:
-                {instruction}
 
-                ### Response:
-                """  # noqa: E501
+def count_generated(new_tokens, eos_ids, pad_token_id, max_new_tokens):
+    """Number of generated tokens (up to and including the first EOS) and whether
+    generation stopped because it hit max_new_tokens rather than EOS."""
+    for i, tok in enumerate(new_tokens):
+        if tok in eos_ids:
+            return i + 1, False
+    # No EOS: drop trailing padding that generate() adds to shorter sequences.
+    n = len(new_tokens)
+    while n > 0 and new_tokens[n - 1] == pad_token_id:
+        n -= 1
+    return n, n >= max_new_tokens
+
+
+def get_eos_ids(tokenizer, model):
+    eos_ids = set()
+    gen_eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    for e in (gen_eos, tokenizer.eos_token_id):
+        if e is None:
+            continue
+        if isinstance(e, (list, tuple)):
+            eos_ids.update(e)
+        else:
+            eos_ids.add(e)
+    return eos_ids
+
+
+def configure_padding(tokenizer, model):
+    """Left padding for batched generation. pad = 0 for llama (<unk>, as in
+    finetune.py); otherwise the tokenizer's own pad token, else EOS."""
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type == "llama":
+        pad_token_id = 0
+    elif tokenizer.pad_token_id is not None:
+        pad_token_id = tokenizer.pad_token_id
+    else:
+        pad_token_id = tokenizer.eos_token_id
+    tokenizer.pad_token_id = pad_token_id
+    tokenizer.padding_side = "left"
+    print(f"model_type={model_type} pad_token_id={pad_token_id} padding_side=left")
+    return pad_token_id
+
+
+def load_done_indices(out_file):
+    done = set()
+    if not os.path.exists(out_file):
+        return done
+    with open(out_file, 'r', encoding='utf-8') as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                done.add(json.loads(line)["index"])
+            except (json.JSONDecodeError, KeyError):
+                print(f"warning: ignoring malformed line {line_no} in {out_file} (will be re-evaluated)")
+    return done
+
+
+def ensure_trailing_newline(out_file):
+    """If a previous run was killed mid-write, make sure new records start on a fresh line."""
+    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+        with open(out_file, 'rb') as f:
+            f.seek(-1, os.SEEK_END)
+            last = f.read(1)
+        if last != b"\n":
+            with open(out_file, 'a', encoding='utf-8') as f:
+                f.write("\n")
+
+
+def report_accuracy(out_file, total):
+    records = {}
+    if os.path.exists(out_file):
+        with open(out_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("index", -1) < total:
+                    records[rec["index"]] = rec
+    n = len(records)
+    n_correct = sum(1 for r in records.values() if r.get("correct"))
+    n_max = sum(1 for r in records.values() if r.get("hit_max_tokens"))
+    if n:
+        print(f"accuracy over {n}/{total} recorded examples: {n_correct}/{n} = {n_correct / n:.4f} "
+              f"| hit max_new_tokens: {n_max}/{n}")
+    else:
+        print("no records found")
 
 
 def load_data(args) -> list:
@@ -182,12 +275,27 @@ def parse_args():
                         required=True)
     parser.add_argument('--model', choices=['LLaMA-7B', 'BLOOM-7B', 'GPT-j-6B'], default="")
     parser.add_argument('--adapter', choices=['LoRA', 'AdapterP', 'AdapterH', 'Parallel', 'Prefix'],
-                        required=True)
+                        default=None, help='label only; no longer used for the output filename')
     parser.add_argument('--base_model', required=True)
-    parser.add_argument('--lora_weights', required=True)
+    parser.add_argument('--lora_weights', default=None,
+                        help='adapter directory (required unless --no_adapter)')
+    parser.add_argument('--no_adapter', action='store_true', default=False,
+                        help='evaluate the base model without loading adapter weights')
     parser.add_argument('--load_8bit', action='store_true', default=False)
+    parser.add_argument('--out_file', required=True,
+                        help='append-only JSONL results file; existing indices are skipped (resume)')
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--limit', type=int, default=None,
+                        help='only evaluate the first N examples (smoke tests)')
+    parser.add_argument('--num_beams', type=int, default=4)
+    parser.add_argument('--max_new_tokens', type=int, default=256)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not args.no_adapter and not args.lora_weights:
+        parser.error('--lora_weights is required unless --no_adapter is given')
+    if args.batch_size < 1:
+        parser.error('--batch_size must be >= 1')
+    return args
 
 
 def load_model(args) -> tuple:
@@ -203,8 +311,7 @@ def load_model(args) -> tuple:
     if not base_model:
         raise ValueError(f'can not find base model name by the value: {args.model}')
     lora_weights = args.lora_weights
-    if not lora_weights:
-        raise ValueError(f'can not find lora weight, the value is: {lora_weights}')
+    use_adapter = not args.no_adapter
 
     load_8bit = args.load_8bit
     if args.model == 'LLaMA-7B':
@@ -219,33 +326,36 @@ def load_model(args) -> tuple:
             device_map="auto",
             trust_remote_code=True,
         ) # fix zwq
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            torch_dtype=torch.float16,
-            device_map={"":0}
-        )
+        if use_adapter:
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                torch_dtype=torch.float16,
+                device_map={"":0}
+            )
     elif device == "mps":
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             device_map={"": device},
             torch_dtype=torch.float16,
         )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-            torch_dtype=torch.float16,
-        )
+        if use_adapter:
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                device_map={"": device},
+                torch_dtype=torch.float16,
+            )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             base_model, device_map={"": device}, low_cpu_mem_usage=True
         )
-        model = PeftModel.from_pretrained(
-            model,
-            lora_weights,
-            device_map={"": device},
-        )
+        if use_adapter:
+            model = PeftModel.from_pretrained(
+                model,
+                lora_weights,
+                device_map={"": device},
+            )
 
         # unwind broken decapoda-research config
         model.config.pad_token_id = tokenizer.pad_token_id = 0  # unk
@@ -255,9 +365,13 @@ def load_model(args) -> tuple:
         if not load_8bit:
             model.half()  # seems to fix bugs for some users.
 
-        model.eval()
         if torch.__version__ >= "2" and sys.platform != "win32":
             model = torch.compile(model)
+
+    # Inference mode in EVERY branch: freshly created LoRA layers are built in
+    # train mode, so without this lora_dropout stays active during generation.
+    model.eval()
+    print(f"adapter: {'none (base model)' if not use_adapter else lora_weights} | training={model.training}")
 
     return tokenizer, model
 
@@ -299,4 +413,4 @@ def extract_answer_letter(args, sentence: str) -> str:
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    main()

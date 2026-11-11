@@ -13,7 +13,12 @@ Unused imports:
 import torch.nn as nn
 import bitsandbytes as bnb
 """
-sys.path.append(os.path.join(os.getcwd(), "peft/src/"))
+# Vendored peft fork: put it FIRST on sys.path, resolved relative to this file
+# (not the cwd), so a pip-installed peft can never shadow it.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "peft", "src"))
+import peft  # noqa: E402
+print(f"Using peft from: {peft.__file__}")
+from prompts import generate_prompt  # noqa: E402
 from peft import (  # noqa: E402
     LoraConfig,
     BottleneckConfig,
@@ -67,6 +72,7 @@ def train(
         wandb_watch: str = "",  # options: false | gradients | all
         wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
+        seed: int = 42,
 ):
     print(
         f"Finetuning model with params:\n"
@@ -99,6 +105,7 @@ def train(
         f"wandb_watch: {wandb_watch}\n"
         f"wandb_log_model: {wandb_log_model}\n"
         f"resume_from_checkpoint: {resume_from_checkpoint}\n"
+        f"seed: {seed}\n"
     )
     assert (
         base_model
@@ -123,6 +130,10 @@ def train(
         os.environ["WANDB_WATCH"] = wandb_watch
     if len(wandb_log_model) > 0:
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
+
+    # Seed BEFORE the model is built so adapter initialisation (LoRA A, bottleneck
+    # down/up weights) is reproducible; Trainer only seeds later, in its __init__.
+    transformers.set_seed(seed)
 
     if load_8bit:
         model = AutoModelForCausalLM.from_pretrained(
@@ -179,10 +190,10 @@ def train(
             return result
 
     def generate_and_tokenize_prompt(data_point):
-        full_prompt = generate_prompt(data_point)
+        full_prompt = generate_prompt(data_point["instruction"], data_point["input"], data_point["output"])
         tokenized_full_prompt = tokenize(full_prompt)
         if not train_on_inputs:
-            user_prompt = generate_prompt({**data_point, "output": ""})
+            user_prompt = generate_prompt(data_point["instruction"], data_point["input"], "")
             tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
             user_prompt_len = len(tokenized_user_prompt["input_ids"])
 
@@ -253,17 +264,32 @@ def train(
 
     if val_set_size > 0:
         train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
+            test_size=val_set_size, shuffle=True, seed=seed
         )
         train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            train_val["train"].shuffle(seed=seed).map(generate_and_tokenize_prompt)
         )
         val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            train_val["test"].shuffle(seed=seed).map(generate_and_tokenize_prompt)
         )
     else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
+        train_data = data["train"].shuffle(seed=seed).map(generate_and_tokenize_prompt)
         val_data = None
+
+    # Truncation report, counted once on the tokenised data. An example whose
+    # tokenised length reached cutoff_len was cut by tokenize() and therefore also
+    # got no EOS (EOS is only appended when len < cutoff_len). This also counts the
+    # rare example that is exactly cutoff_len tokens long untruncated, which
+    # likewise gets no EOS.
+    for split_name, split in (("train", train_data), ("val", val_data)):
+        if split is None:
+            continue
+        n_cut = sum(len(ids) >= cutoff_len for ids in split["input_ids"])
+        print(
+            f"[truncation] {split_name}: {n_cut}/{len(split)} examples "
+            f"({100.0 * n_cut / max(len(split), 1):.1f}%) reached cutoff_len={cutoff_len} "
+            f"(truncated, no EOS appended)"
+        )
 
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
@@ -292,8 +318,10 @@ def train(
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
+            # "none" explicitly: in transformers 4.x, None means "all installed integrations".
+            report_to="wandb" if use_wandb else "none",
             run_name=wandb_run_name if use_wandb else None,
+            seed=seed,
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
@@ -318,29 +346,6 @@ def train(
     print(
         "\n If there's a warning about missing keys above, please disregard :)"
     )
-
-
-def generate_prompt(data_point):
-    # sorry about the formatting disaster gotta move fast
-    if data_point["input"]:
-        return f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request. 
-
-                ### Instruction:
-                {data_point["instruction"]}
-                
-                ### Input:
-                {data_point["input"]}
-                
-                ### Response:
-                {data_point["output"]}""" # noqa: E501
-    else:
-        return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.  
-
-                ### Instruction:
-                {data_point["instruction"]}
-                
-                ### Response:
-                {data_point["output"]}""" # noqa: E501
 
 
 if __name__ == "__main__":
