@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 from typing import List
@@ -73,6 +74,7 @@ def train(
         wandb_log_model: str = "",  # options: false | true
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
         seed: int = 42,
+        precision: str = "fp16",  # fp16 | bf16 | fp32
 ):
     print(
         f"Finetuning model with params:\n"
@@ -106,10 +108,14 @@ def train(
         f"wandb_log_model: {wandb_log_model}\n"
         f"resume_from_checkpoint: {resume_from_checkpoint}\n"
         f"seed: {seed}\n"
+        f"precision: {precision}\n"
     )
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
+    dtype_map = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+    assert precision in dtype_map, f"--precision must be one of fp16|bf16|fp32, got {precision!r}"
+    torch_dtype = dtype_map[precision]
     gradient_accumulation_steps = batch_size // micro_batch_size
 
     device_map = "auto"
@@ -139,7 +145,7 @@ def train(
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             device_map=device_map,
             trust_remote_code=True,
         )
@@ -147,7 +153,7 @@ def train(
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=False,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             device_map={"": int(os.environ.get("LOCAL_RANK") or 0)},
             trust_remote_code=True,
         )
@@ -306,7 +312,8 @@ def train(
             warmup_steps=100,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
-            fp16=True,
+            fp16=(precision == "fp16"),
+            bf16=(precision == "bf16"),
             logging_steps=10,
             optim="adamw_torch",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
@@ -340,6 +347,15 @@ def train(
         model = torch.compile(model)
 
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    # Count logged steps whose gradient norm was nan/inf (fp16 overflow skips those steps).
+    grad_norms = [e["grad_norm"] for e in trainer.state.log_history if e.get("grad_norm") is not None]
+    n_logged = len(grad_norms)
+    n_bad = sum(not math.isfinite(float(g)) for g in grad_norms)
+    print(f"[grad_check] nan_or_inf_grad_norm: {n_bad}/{n_logged}")
+    if n_logged and n_bad / n_logged > 0.2:
+        print(f"!!!!! WARNING: {n_bad}/{n_logged} ({n_bad / n_logged:.0%}) logged steps had nan/inf grad_norm "
+              f"with precision={precision}. Training is likely broken; consider --precision bf16 or fp32. !!!!!")
 
     model.save_pretrained(output_dir)
 

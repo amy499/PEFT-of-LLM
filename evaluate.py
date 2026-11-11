@@ -32,6 +32,7 @@ except:  # noqa: E722
 
 def main():
     args = parse_args()
+    print(f"precision: {args.precision}")
 
     dataset = load_data(args)
     if args.limit is not None:
@@ -289,6 +290,8 @@ def parse_args():
                         help='only evaluate the first N examples (smoke tests)')
     parser.add_argument('--num_beams', type=int, default=4)
     parser.add_argument('--max_new_tokens', type=int, default=256)
+    parser.add_argument('--precision', choices=['fp16', 'bf16', 'fp32'], default='fp16',
+                        help='torch_dtype for the base model and adapter on CUDA')
 
     args = parser.parse_args()
     if not args.no_adapter and not args.lora_weights:
@@ -319,10 +322,11 @@ def load_model(args) -> tuple:
     else:
         tokenizer = AutoTokenizer.from_pretrained(base_model)
     if device == "cuda":
+        torch_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.precision]
         model = AutoModelForCausalLM.from_pretrained(
             base_model,
             load_in_8bit=load_8bit,
-            torch_dtype=torch.float16,
+            torch_dtype=torch_dtype,
             device_map="auto",
             trust_remote_code=True,
         ) # fix zwq
@@ -330,7 +334,7 @@ def load_model(args) -> tuple:
             model = PeftModel.from_pretrained(
                 model,
                 lora_weights,
-                torch_dtype=torch.float16,
+                torch_dtype=torch_dtype,
                 device_map={"":0}
             )
     elif device == "mps":
