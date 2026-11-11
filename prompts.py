@@ -49,3 +49,66 @@ def generate_prompt(instruction, input=None, output=""):
         + _INDENT + "### Response:\n"
         + _INDENT + output
     )
+
+
+# ---------------------------------------------------------------------------
+# "repo" prompt style: the ORIGINAL upstream templates, byte-for-byte, with no
+# stripping. Training and evaluation templates differ from each other (header
+# trailing spaces, indented vs empty blank lines) exactly as upstream did.
+# Spelled out with explicit escapes so trailing whitespace cannot be lost.
+# ---------------------------------------------------------------------------
+
+def generate_prompt_repo_train(data_point):
+    """Original finetune.py generate_prompt(data_point) (commit e685dea~1)."""
+    if data_point["input"]:
+        return (
+            "Below is an instruction that describes a task, paired with an input that provides "
+            "further context. Write a response that appropriately completes the request. \n"  # 1 trailing space
+            "\n"
+            + _INDENT + "### Instruction:\n"
+            + _INDENT + f"{data_point['instruction']}\n"
+            + _INDENT + "\n"
+            + _INDENT + "### Input:\n"
+            + _INDENT + f"{data_point['input']}\n"
+            + _INDENT + "\n"
+            + _INDENT + "### Response:\n"
+            + _INDENT + f"{data_point['output']}"
+        )
+    return (
+        "Below is an instruction that describes a task. Write a response that appropriately "
+        "completes the request.  \n"  # 2 trailing spaces
+        "\n"
+        + _INDENT + "### Instruction:\n"
+        + _INDENT + f"{data_point['instruction']}\n"
+        + _INDENT + "\n"
+        + _INDENT + "### Response:\n"
+        + _INDENT + f"{data_point['output']}"
+    )
+
+
+def generate_prompt_repo_eval(instruction, input=None):
+    """Original evaluate.py generate_prompt(instruction, input=None) (commit e685dea~1)."""
+    if input:
+        return (
+            "Below is an instruction that describes a task, paired with an input that provides "
+            "further context. Write a response that appropriately completes the request.\n"  # no trailing space
+            "\n"
+            + _INDENT + "### Instruction:\n"
+            + _INDENT + f"{instruction}\n"
+            "\n"
+            + _INDENT + "### Input:\n"
+            + _INDENT + f"{input}\n"
+            "\n"
+            + _INDENT + "### Response:\n"
+            + _INDENT
+        )
+    return (
+        "Below is an instruction that describes a task. Write a response that appropriately "
+        "completes the request. \n"  # 1 trailing space
+        "\n"
+        + _INDENT + "### Instruction:\n"
+        + _INDENT + f"{instruction}\n"
+        "\n"
+        + _INDENT + "### Response:\n"
+        + _INDENT
+    )

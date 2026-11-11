@@ -19,7 +19,7 @@ import bitsandbytes as bnb
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "peft", "src"))
 import peft  # noqa: E402
 print(f"Using peft from: {peft.__file__}")
-from prompts import generate_prompt  # noqa: E402
+from prompts import generate_prompt, generate_prompt_repo_train  # noqa: E402
 from peft import (  # noqa: E402
     LoraConfig,
     BottleneckConfig,
@@ -75,6 +75,7 @@ def train(
         resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
         seed: int = 42,
         precision: str = "fp16",  # fp16 | bf16 | fp32
+        prompt_style: str = "fixed",  # fixed (shared prompts.py, stripped) | repo (original upstream template)
 ):
     print(
         f"Finetuning model with params:\n"
@@ -109,7 +110,9 @@ def train(
         f"resume_from_checkpoint: {resume_from_checkpoint}\n"
         f"seed: {seed}\n"
         f"precision: {precision}\n"
+        f"prompt_style: {prompt_style}\n"
     )
+    assert prompt_style in ("fixed", "repo"), f"--prompt_style must be fixed|repo, got {prompt_style!r}"
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
@@ -196,10 +199,16 @@ def train(
             return result
 
     def generate_and_tokenize_prompt(data_point):
-        full_prompt = generate_prompt(data_point["instruction"], data_point["input"], data_point["output"])
+        if prompt_style == "repo":
+            full_prompt = generate_prompt_repo_train(data_point)
+        else:
+            full_prompt = generate_prompt(data_point["instruction"], data_point["input"], data_point["output"])
         tokenized_full_prompt = tokenize(full_prompt)
         if not train_on_inputs:
-            user_prompt = generate_prompt(data_point["instruction"], data_point["input"], "")
+            if prompt_style == "repo":
+                user_prompt = generate_prompt_repo_train({**data_point, "output": ""})
+            else:
+                user_prompt = generate_prompt(data_point["instruction"], data_point["input"], "")
             tokenized_user_prompt = tokenize(user_prompt, add_eos_token=False)
             user_prompt_len = len(tokenized_user_prompt["input_ids"])
 

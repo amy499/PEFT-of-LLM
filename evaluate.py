@@ -16,7 +16,7 @@ from peft import PeftModel
 from tqdm import tqdm
 from transformers import GenerationConfig, LlamaForCausalLM, LlamaTokenizer, AutoModelForCausalLM, AutoTokenizer
 
-from prompts import generate_prompt
+from prompts import generate_prompt, generate_prompt_repo_eval
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -33,6 +33,7 @@ except:  # noqa: E722
 def main():
     args = parse_args()
     print(f"precision: {args.precision}")
+    print(f"prompt_style: {args.prompt_style}")
 
     dataset = load_data(args)
     if args.limit is not None:
@@ -61,7 +62,10 @@ def main():
             max_new_tokens=256,
             **kwargs,
     ):
-        prompts = [generate_prompt(instruction, input) for instruction in instructions]
+        if args.prompt_style == "repo":
+            prompts = [generate_prompt_repo_eval(instruction, input) for instruction in instructions]
+        else:
+            prompts = [generate_prompt(instruction, input) for instruction in instructions]
         inputs = tokenizer(prompts, return_tensors="pt", padding=True)  # left-padded
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
@@ -292,6 +296,9 @@ def parse_args():
     parser.add_argument('--max_new_tokens', type=int, default=256)
     parser.add_argument('--precision', choices=['fp16', 'bf16', 'fp32'], default='fp16',
                         help='torch_dtype for the base model and adapter on CUDA')
+    parser.add_argument('--prompt_style', choices=['fixed', 'repo'], default='fixed',
+                        help='fixed: shared prompts.py template (instruction stripped); '
+                             'repo: original upstream evaluate.py template, unmodified')
 
     args = parser.parse_args()
     if not args.no_adapter and not args.lora_weights:
